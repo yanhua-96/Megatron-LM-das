@@ -8,8 +8,16 @@ do
         data_path=${para#*=}
     elif [[ $para == --tokenizer_path* ]];then
         tokenizer_path=${para#*=}
-    elif [[ $para == --checkpoint_path* ]];then
-        checkpoint_path=${para#*=}
+    elif [[ $para == --load_checkpoint_path* ]];then
+        load_checkpoint_path=${para#*=}
+    elif [[ $para == --save_checkpoint_path* ]];then
+        save_checkpoint_path=${para#*=}
+    elif [[ $para == --save_ckpt* ]];then
+        save_ckpt=${para#*=}
+    elif [[ $para == --train_iters* ]];then
+        train_iters=${para#*=}
+    elif [[ $para == --save_interval* ]];then
+        save_interval=${para#*=}
     elif [[ $para == --launch_with_binding* ]];then
         launch_with_binding=${para#*=}
     elif [[ $para == --launch_backend* ]];then
@@ -32,7 +40,9 @@ done
 # data path
 DATA_PATH=${data_path}
 TOKENIZER_MODEL_PATH=${tokenizer_path}
-CHECKPOINT_PATH=${checkpoint_path}
+LOAD_CHECKPOINT_PATH=${load_checkpoint_path:-}
+SAVE_CKPT=${save_ckpt:-false}
+SAVE_CHECKPOINT_PATH=${save_checkpoint_path:-}
 
 # 运行环境参数
 DIST_URL=${1}
@@ -48,6 +58,7 @@ NODE_RANK=${NODE_RANK:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-0}}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
 MEGATRON_PATH=$( dirname $( dirname ${CURRENT_DIR}))
+TENSORBOARD_DIR=${tensorboard_dir:-${TENSORBOARD_DIR:-${CURRENT_DIR}/tensorboard/$(date +%F-%H%M%S)}}
 
 # default env
 export GPU_MAX_HW_QUEUES=4
@@ -66,8 +77,47 @@ SEQ_LEN=4096
 MAX_POSITION_EMBEDDINGS=4096
 
 # train iteration hyperparameters
-TRAIN_ITERS=50
+# train_iters is the total, including iterations already done in the loaded checkpoint.
+TRAIN_ITERS=${train_iters:-10}
+SAVE_INTERVAL=${save_interval:-${TRAIN_ITERS}}
 LR_WARMUP_ITERS=1
+
+CHECKPOINT_ARGS=""
+if [[ "${SAVE_CKPT}" == "true" ]]; then
+    if [[ -z "${SAVE_CHECKPOINT_PATH}" ]]; then
+        echo "--save_checkpoint_path is required with --save_ckpt=true." >&2
+        exit 1
+    fi
+    SAVE_CHECKPOINT_PATH=$(realpath -m -- "${SAVE_CHECKPOINT_PATH}") || exit 1
+    CHECKPOINT_ARGS="--save ${SAVE_CHECKPOINT_PATH} "
+fi
+if [[ -n "${LOAD_CHECKPOINT_PATH}" ]]; then
+    LOAD_CHECKPOINT_PATH=$(realpath -m -- "${LOAD_CHECKPOINT_PATH}") || exit 1
+    if [[ "${SAVE_CKPT}" == "true" && "${LOAD_CHECKPOINT_PATH}" == "${SAVE_CHECKPOINT_PATH}" ]]; then
+        echo "Load and save checkpoint directories must be different." >&2
+        exit 1
+    fi
+    tracker="${LOAD_CHECKPOINT_PATH}/latest_checkpointed_iteration.txt"
+    if [[ ! -r "${tracker}" ]]; then
+        echo "Missing checkpoint tracker: ${tracker}" >&2
+        exit 1
+    fi
+    checkpoint_iteration=$(<"${tracker}")
+    if [[ ! "${checkpoint_iteration}" =~ ^[0-9]+$ ]]; then
+        echo "Resume requires a numeric training iteration in ${tracker}." >&2
+        exit 1
+    fi
+    checkpoint_iteration=$((10#${checkpoint_iteration}))
+    if (( TRAIN_ITERS <= checkpoint_iteration )); then
+        echo "train_iters (${TRAIN_ITERS}) must exceed checkpoint iteration (${checkpoint_iteration})." >&2
+        exit 1
+    fi
+    # common.pt holds Python objects (e.g. signal.SIGTERM), not only weights;
+    # PyTorch >= 2.6 otherwise loads without weights_only=False.
+    export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+    CHECKPOINT_ARGS+="--load ${LOAD_CHECKPOINT_PATH} --exit-on-missing-checkpoint --use-checkpoint-opt-param-scheduler "
+    echo "Resume from iteration ${checkpoint_iteration}: ${LOAD_CHECKPOINT_PATH}"
+fi
 
 MPI_DISTRIBUTED_ARGS=(
     --rank ${RANK}
@@ -116,7 +166,7 @@ TRAINING_ARGS=(
     --lr-decay-style cosine 
     --min-lr 3.0e-6
     --lr-warmup-iters ${LR_WARMUP_ITERS}
-    --ckpt-format torch
+    --ckpt-format torch_dist
     --ddp-average-in-collective
     --overlap-grad-reduce
     --use-flash-attn
@@ -134,18 +184,17 @@ DATA_ARGS=(
     --tokenizer-type HuggingFaceTokenizer
     --tokenizer-model ${TOKENIZER_MODEL_PATH}
     --data-path ${DATA_PATH} 
-    --split 949,50,1
+    --split 1,0,0
 )
 
 EVAL_AND_LOGGING_ARGS=(
     --log-throughput
-    --eval-iters 5
+    --eval-iters 0
     --log-interval 1
-    --save-interval 1000 
+    --save-interval ${SAVE_INTERVAL}
     --eval-interval 1000 
-    # --save $CHECKPOINT_PATH
-    # --load $CHECKPOINT_PATH
-    --tensorboard-dir "${CHECKPOINT_PATH}/tensorboard" 
+    ${CHECKPOINT_ARGS}
+    --tensorboard-dir "${TENSORBOARD_DIR}"
 )
 
 TORCH_PROFIE_ARGS=(

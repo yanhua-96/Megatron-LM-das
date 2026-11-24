@@ -1,26 +1,51 @@
 #!/bin/bash
 
+set -eo pipefail
+
 for para in "$@"
 do
-    if [[ $para == --profiling* ]]; then
+    if [[ $para == --model=* ]]; then
+        model=${para#*=}
+    elif [[ $para == --profiling* ]]; then
         profiling=${para#*=}
+    elif [[ $para == --load_checkpoint_path=* ]]; then
+        load_checkpoint_path=${para#*=}
+    elif [[ $para == --save_checkpoint_path=* ]]; then
+        save_checkpoint_path=${para#*=}
+    elif [[ $para == --save_ckpt=* ]]; then
+        save_ckpt=${para#*=}
+    elif [[ $para == --train_iters=* ]]; then
+        train_iters=${para#*=}
+    elif [[ $para == --save_interval=* ]]; then
+        save_interval=${para#*=}
     fi
 done
 
 # Those variables no need to modify
-hostfile_input=${1}
-node_num=${2}
-
+hostfile_input=${CURRENT_DIR}/hostfile
+node_num=1
 CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
 MEGATRON_PATH=$( dirname $( dirname ${CURRENT_DIR}))
 
 # Those variables need to modify
-DTK_ENV="${DTK_ENV:-}"                                                               # where env.sh of dtk
-DATA_PATH="${DATA_PATH:-}"                                                             # path to oscar-1GB_head-llama2_text_document
-TOKENIZER_MODEL_PATH="${TOKENIZER_MODEL_PATH:-}"                                                  # path to tokenizer.model
-LAUNCHER="mpirun"                                                        # mpirun or torchrun
-CHECKPOINT_PATH=""                                                       # path to ckpt
-TRAIN_SCRIPT=${TRAIN_SCRIPT:-train_llama2_7B.sh}                         # script under this example directory to run
+DTK_ENV=${DTK_ENV:-/opt/dtk/env.sh}
+DATA_PATH=${DATA_PATH:-${CURRENT_DIR}/data/dataset/oscar-en-10k_text_document}
+TOKENIZER_MODEL_PATH=${TOKENIZER_MODEL_PATH:-${CURRENT_DIR}/data/tokenizer}
+LAUNCHER=${LAUNCHER:-torchrun}
+SAVE_CKPT=${save_ckpt:-false}
+if [[ "${SAVE_CKPT}" != "true" && "${SAVE_CKPT}" != "false" ]]; then
+    echo "--save_ckpt must be true or false." >&2
+    exit 1
+fi
+SAVE_CHECKPOINT_PATH=${save_checkpoint_path:-./ckpt_save}
+TRAIN_ITERS=${train_iters:-10}
+SAVE_INTERVAL=${save_interval:-${TRAIN_ITERS}}
+MODEL=${model:-7B}
+case "${MODEL}" in
+    7B|13B|70B) ;;
+    *) echo "--model must be 7B, 13B or 70B." >&2; exit 1 ;;
+esac
+TRAIN_SCRIPT=train_llama2_${MODEL}.sh                                   # script under this example directory to run
 NCCL_ENV=${NCCL_ENV:-${MEGATRON_PATH}/requirements/env.sh}                            # Please adjust the variables based on the actual NET being used
 LAUNCH_WITH_BINDING=${MEGATRON_PATH}/requirements/launch_with_binding.sh # Please adjust the variables based on the actual NET being used
 SSH_PORT=${SSH_PORT:-}                                                   # mpirun 跨机 ssh 端口；容器 sshd 不是默认 22 时必须设置（hcu-bench 跑时由 container.ssh_port 自动注入）
@@ -63,6 +88,7 @@ if [[ "${LAUNCHER}" == "torchrun" ]]; then
         -x PATH \
         -x LD_LIBRARY_PATH \
         -x PYTHONPATH \
+        -x HIP_VISIBLE_DEVICES \
         -x MASTER_ADDR=${MASTER_ADDR} \
         -x MASTER_PORT=${MASTER_PORT} \
         -x NNODES=${node_num} \
@@ -89,9 +115,13 @@ CMD="mpirun -np ${MPIRUN_NP} --hostfile ${HOSTFILE} \
     --data_path=${DATA_PATH} \
     --launch_backend=${LAUNCHER} \
     --tokenizer_path=${TOKENIZER_MODEL_PATH} \
-    --checkpoint_path=${CHECKPOINT_PATH} \
+    --load_checkpoint_path=${load_checkpoint_path:-} \
+    --save_checkpoint_path=${SAVE_CHECKPOINT_PATH} \
+    --save_ckpt=${SAVE_CKPT} \
+    --train_iters=${TRAIN_ITERS} \
+    --save_interval=${SAVE_INTERVAL} \
     --launch_with_binding=${LAUNCH_WITH_BINDING} \
-    --profiling=${profiling}' 2>&1 | tee log-${node_num}nodes-$(date +%F-%H%M).log
+    --profiling=${profiling}' 2>&1 | tee BW1100-log-${node_num}nodes-$(date +%F-%H%M).log
 "
 
 eval ${CMD}
