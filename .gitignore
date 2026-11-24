@@ -4,3 +4,9 @@ __pycache__
 .vscode
 .idea
 .coverage.*
+
+*ckpt*
+data
+tensorboard
+!examples/llama2/data
+cache
